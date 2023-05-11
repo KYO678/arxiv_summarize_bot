@@ -12,8 +12,10 @@ with open("config.yaml", "r") as f:
     config = yaml.safe_load(f)
 
 # Set up APIs
-openai.api_key = config["openai"]["api_key"]  # bot_summarize
-SLACK_API_TOKEN = config["slack"]["api_key"]  # slack_api_key
+# openai.api_key = config["openai"]["api_key"]  # bot_summarize
+# SLACK_API_TOKEN = config["slack"]["api_key"]  # slack_api_key
+openai.api_key = st.secrets.gptApiKey.key
+SLACK_API_TOKEN = st.secrets.SlackApiKey.key
 
 # Slackに投稿するチャンネル名を指定する
 SLACK_CHANNEL = "#news-bot1"
