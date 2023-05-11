@@ -9,6 +9,10 @@ Codeは下記の参考文献に則って作成しています。
 4. 今後の展望
 5. 想定され得る批判
 
+# paper_summary_streamlitapp
+## Paper Summary by ChatGPT
+arXivの論文タイトルを入力し、サマリしてSlackにpostするアプリです。ChatGPTのgpt-3.5-turbo APIを使って下記のプロンプトに則って論文をサマリします。プロンプトも自由に修正できるようにテキスト欄を用意しています。
+
 ## 今後の予定
 1. lambdaでクラウドサーバ上で定期的に実行できるように
 2. arXivはAPI経由で取得可能だが、他の論文誌もスクレイプして投稿できるように
