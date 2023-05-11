@@ -18,7 +18,6 @@ SLACK_API_TOKEN = config["slack"]["api_key"]  # slack_api_key
 # Slackに投稿するチャンネル名を指定する
 SLACK_CHANNEL = "#news-bot1"
 
-
 def get_summary(result):
     system = """まず、与えられた論文の背景となっていた課題、要点3点、今後の展望をまとめ、以下のフォーマットで日本語で出力してください。```
     タイトルの日本語訳
@@ -88,26 +87,26 @@ def main():
         results = random.sample(result_list, k=num_papers)
 
         # 論文情報をSlackに投稿し、Streamlit上にも表示する
-        for i, result in enumerate(results):
-            try:
-                # プロンプトをカスタマイズ
-                system = custom_prompt
+        result = results[0]
+        try:
+            # プロンプトをカスタマイズ
+            system = custom_prompt
 
-                # Slackに投稿するメッセージを組み立てる
-                message = "論文のサマリです。\n" + get_summary(result)
+            # Slackに投稿するメッセージを組み立てる
+            message = "論文のサマリです。\n" + get_summary(result)
 
-                # Slackにメッセージを投稿する
-                response = client.chat_postMessage(
-                    channel=SLACK_CHANNEL,
-                    text=message
-                )
-                st.success("メッセージが投稿されました。")
-                st.write("### サマリ:")
-                st.write(message)
-                print(f"Message posted: {response['ts']}")
-            except SlackApiError as e:
-                st.error("メッセージの投稿中にエラーが発生しました。")
-                print(f"Error posting message: {e}")
+            # Slackにメッセージを投稿する
+            response = client.chat_postMessage(
+                channel=SLACK_CHANNEL,
+                text=message
+            )
+            st.success("メッセージが投稿されました。")
+            st.write("### サマリ:")
+            st.write(message)
+            print(f"Message posted: {response['ts']}")
+        except SlackApiError as e:
+            st.error("メッセージの投稿中にエラーが発生しました。")
+            print(f"Error posting message: {e}")
 
 if __name__ == '__main__':
     main()
