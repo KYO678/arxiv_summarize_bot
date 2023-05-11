@@ -1,15 +1,10 @@
 import os
-import yaml
 import streamlit as st
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 import arxiv
 import openai
 import random
-
-# Load API keys from config.yaml
-with open("config.yaml", "r") as f:
-    config = yaml.safe_load(f)
 
 # Set up APIs
 # openai.api_key = config["openai"]["api_key"]  # bot_summarize
