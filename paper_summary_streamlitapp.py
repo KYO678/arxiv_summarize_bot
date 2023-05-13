@@ -20,7 +20,7 @@ from notion_client import Client
 openai.api_key = st.secrets.gptApiKey.key
 SLACK_API_TOKEN = st.secrets.SlackApiKey.key
 NOTION_API_KEY = st.secrets.NotionApiKey.key
-notion = Client(auth=NOTION_API_KEY)
+NOTION_DATABASE_URL = st.secrets.NotionDatabaseUrl.key
 notion_client = Client(auth=NOTION_API_KEY)
 
 # Slackに投稿するチャンネル名を指定する
