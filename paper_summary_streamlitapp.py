@@ -1,22 +1,32 @@
 import os
+import yaml
 import streamlit as st
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 import arxiv
 import openai
 import random
+from notion_client import Client
+
+# Load API keys from config.yaml
+with open("config.yaml", "r") as f:
+    config = yaml.safe_load(f)
 
 # Set up APIs
-# openai.api_key = config["openai"]["api_key"]  # bot_summarize
-# SLACK_API_TOKEN = config["slack"]["api_key"]  # slack_api_key
+#openai.api_key = config["openai"]["api_key"]  # bot_summarize
+#SLACK_API_TOKEN = config["slack"]["api_key"]  # slack_api_key
+#NOTION_API_KEY = config["notion"]["api_key"] 
+#NOTION_DATABASE_URL = config["notion"]["database_url"] 
 openai.api_key = st.secrets.gptApiKey.key
 SLACK_API_TOKEN = st.secrets.SlackApiKey.key
+NOTION_API_KEY = st.secrets.NotionApiKey.key
+notion = Client(auth=NOTION_API_KEY)
+notion_client = Client(auth=NOTION_API_KEY)
 
 # Slackに投稿するチャンネル名を指定する
 SLACK_CHANNEL = "#news-bot1"
 
-def get_summary(result):
-    system = """まず、与えられた論文の背景となっていた課題、要点3点、今後の展望をまとめ、以下のフォーマットで日本語で出力してください。```
+default_prompt = """まず、与えられた論文の背景となっていた課題、要点3点、今後の展望をまとめ、以下のフォーマットで日本語で出力してください。```
     タイトルの日本語訳
     ・背景課題
     ・要点1
@@ -27,11 +37,12 @@ def get_summary(result):
     また、与えられた論文について想定され得る批判を述べてください。
     """
 
+def get_summary(prompt, result):
     text = f"title: {result.title}\nbody: {result.summary}"
     response = openai.ChatCompletion.create(
         model="gpt-3.5-turbo",
         messages=[
-            {"role": "system", "content": system},
+            {"role": "system", "content": prompt},
             {"role": "user", "content": text},
         ],
         temperature=0.25,
@@ -45,6 +56,57 @@ def get_summary(result):
 
     return message
 
+def add_summary_to_notion(summary):
+    notion_client.pages.create(**{
+        "parent": { 
+            'database_id': NOTION_DATABASE_URL
+        },
+        "properties": {
+            "Name": {
+            "title": [
+            {
+                "text": {
+                "content": summary["title"]
+                }
+            }
+            ],
+        },
+
+        "Tags":{
+            "multi_select":[
+                {
+                    "name": "arXiv"
+                    }
+            ]
+        },
+
+        "Published":{
+                "date":{
+                    "start": summary["date"]
+                }
+        },
+
+        "URL": {
+                "url": summary["url"]
+            }
+
+        },
+
+        "children": [
+        {
+        "object": "block",
+        "type": "paragraph",
+        "paragraph": {
+            "rich_text": [{ 
+                "type": "text", 
+                "text": { 
+                    "content": summary["summary"]
+                } 
+            }]
+        }
+        }
+    ]
+    })
 
 def main():
     # Slack APIクライアントを初期化する
@@ -53,19 +115,9 @@ def main():
     st.title("Paper Summary by ChatGPT")
     paper_title = st.text_input("arXivの論文のタイトルを入力してください:")
 
-    default_prompt = """まず、与えられた論文の背景となっていた課題、要点3点、今後の展望をまとめ、以下のフォーマットで日本語で出力してください。```
-    タイトルの日本語訳
-    ・背景課題
-    ・要点1
-    ・要点2
-    ・要点3
-    ・今後の展望
-    ```
-    また、与えられた論文について想定され得る批判を述べてください。
-    """
     custom_prompt = st.text_area("プロンプトをカスタマイズしてください:", value=default_prompt, height=200)
 
-    if st.button("検索してSlackに通知"):
+    if st.button("論文を検索して要約"):
         query = f'ti:"{paper_title}"'
 
         # arxiv APIで最新の論文情報を取得する
@@ -75,22 +127,31 @@ def main():
             sort_by=arxiv.SortCriterion.SubmittedDate,
             sort_order=arxiv.SortOrder.Descending,
         )
+
         # searchの結果をリストに格納
         result_list = []
         for result in search.results():
             result_list.append(result)
+            
         # ランダムにnum_papersの数だけ選ぶ
-        num_papers = 1
-        results = random.sample(result_list, k=num_papers)
+        #num_papers = 1
+        #results = random.sample(result_list, k=num_papers)
+
+        summary = {
+        "title": result.title,
+        "summary": get_summary(custom_prompt, result),
+        "url": result.entry_id,
+        "date": result.published.strftime("%Y-%m-%d"),
+        }
 
         # 論文情報をSlackに投稿し、Streamlit上にも表示する
-        result = results[0]
+        result = result_list[0]
         try:
             # プロンプトをカスタマイズ
             system = custom_prompt
 
             # Slackに投稿するメッセージを組み立てる
-            message = "論文のサマリです。\n" + get_summary(result)
+            message = "論文のサマリです。\n" + get_summary(custom_prompt, result)
 
             # Slackにメッセージを投稿する
             response = client.chat_postMessage(
@@ -101,9 +162,19 @@ def main():
             st.write("### サマリ:")
             st.write(message)
             print(f"Message posted: {response['ts']}")
+
         except SlackApiError as e:
             st.error("メッセージの投稿中にエラーが発生しました。")
             print(f"Error posting message: {e}")
+
+        # Add the summary to the Notion database
+        try:
+            add_summary_to_notion(summary)
+            st.success("サマリがNotionデータベースに追加されました。")
+
+        except Exception as e:
+            st.error("サマリのNotionデータベースへの追加中にエラーが発生しました。")
+            print(f"Error adding summary to Notion: {e}")
 
 if __name__ == '__main__':
     main()
