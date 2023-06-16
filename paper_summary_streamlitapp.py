@@ -45,7 +45,7 @@ default_prompt = """まず、与えられた論文の背景となっていた課
 def get_summary(prompt, result):
     text = f"title: {result.title}\nbody: {result.summary}"
     response = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
+        model="gpt-3.5-turbo-16k",
         messages=[
             {"role": "system", "content": prompt},
             {"role": "user", "content": text},
