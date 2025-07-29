@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 
 # ページ設定
 st.set_page_config(
-    page_title="📚 Paper Summarization",
+    page_title="📚 Paper Summary by ChatGPT",
     page_icon="📚",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -122,7 +122,7 @@ SLACK_CHANNEL = "#news-bot1"
 
 GPT_MODELS = {
     "GPT-4o": "gpt-4o-2024-08-06",
-    "GPT-4.2 nano": "gpt-4.1-nano-2025-04-14", 
+    "GPT-4.1 nano": "gpt-4.1-nano-2025-04-14", 
     "GPT-4.1": "gpt-4.1-2025-04-14",
     "o3": "o3-2025-04-16"
 }
@@ -415,7 +415,9 @@ def main():
             height=300,
             help="論文要約のためのプロンプトを自由に編集できます"
         )
-    else:
+    
+    # エキスパンダーが閉じている場合はデフォルトプロンプトを使用
+    if 'custom_prompt' not in locals():
         custom_prompt = DEFAULT_PROMPT
 
     # 検索ボタン
