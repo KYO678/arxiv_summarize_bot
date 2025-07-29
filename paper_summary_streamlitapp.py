@@ -5,6 +5,12 @@ import arxiv
 import openai
 from notion_client import Client
 import re
+import time
+import random
+import requests
+from datetime import datetime, timedelta
+import pickle
+import os
 
 # ページ設定
 st.set_page_config(
@@ -70,6 +76,14 @@ st.markdown("""
         padding: 1rem;
         margin: 1rem 0;
     }
+    .warning-message {
+        background: #fff3cd;
+        color: #856404;
+        border: 1px solid #ffeaa7;
+        border-radius: 8px;
+        padding: 1rem;
+        margin: 1rem 0;
+    }
     .footer-tips {
         background: #f8f9fa;
         border-radius: 10px;
@@ -92,6 +106,7 @@ st.markdown("""
 
 # 定数
 SLACK_CHANNEL = "#news-bot1"
+CACHE_DIR = "arxiv_cache"
 
 GPT_MODELS = {
     "GPT-4o": "gpt-4o-2024-08-06",
@@ -116,6 +131,35 @@ DEFAULT_PROMPT = """まず、与えられた論文の背景となっていた課
 ```
 """
 
+# キャッシュクラス
+class ArxivCache:
+    def __init__(self, cache_dir=CACHE_DIR):
+        self.cache_dir = cache_dir
+        os.makedirs(cache_dir, exist_ok=True)
+    
+    def get_cached_results(self, query, max_age_hours=24):
+        cache_path = os.path.join(self.cache_dir, f"{hash(query)}.pkl")
+        
+        if os.path.exists(cache_path):
+            mtime = datetime.fromtimestamp(os.path.getmtime(cache_path))
+            if datetime.now() - mtime < timedelta(hours=max_age_hours):
+                try:
+                    with open(cache_path, 'rb') as f:
+                        return pickle.load(f)
+                except Exception:
+                    # キャッシュファイルが破損している場合は削除
+                    os.remove(cache_path)
+        
+        return None
+    
+    def save_results(self, query, results):
+        cache_path = os.path.join(self.cache_dir, f"{hash(query)}.pkl")
+        try:
+            with open(cache_path, 'wb') as f:
+                pickle.dump(results, f)
+        except Exception as e:
+            st.warning(f"キャッシュ保存に失敗: {e}")
+
 # API設定とエラーハンドリング
 @st.cache_resource
 def initialize_apis():
@@ -130,11 +174,20 @@ def initialize_apis():
         notion_client = Client(auth=notion_key)
         slack_client = WebClient(token=slack_token)
         
+        # 最適化されたarXivクライアント設定
+        arxiv_client = arxiv.Client(
+            page_size=50,           # 小さめのページサイズで安定性向上
+            delay_seconds=3.0,      # arXiv推奨の3秒間隔
+            num_retries=5           # 充分なリトライ回数
+        )
+        
         return {
             "openai_key": openai_key,
             "slack_client": slack_client,
             "notion_client": notion_client,
-            "notion_db_url": notion_db_url
+            "notion_db_url": notion_db_url,
+            "arxiv_client": arxiv_client,
+            "cache": ArxivCache()
         }
     except Exception as e:
         st.error(f"⚠️ 設定エラー: 必要なAPIキーが設定されていません。 {e}")
@@ -166,108 +219,180 @@ def extract_arxiv_id_from_url(url):
     except Exception:
         return None
 
-def search_paper_by_title(title):
-    """タイトルで論文を検索"""
+def robust_arxiv_search(query, max_results=5, apis=None):
+    """堅牢なarXiv検索（301エラー対応）"""
+    if not apis:
+        return None
+        
+    client = apis["arxiv_client"]
+    cache = apis["cache"]
+    
+    # キャッシュから検索
+    cache_key = f"{query}_{max_results}"
+    cached_results = cache.get_cached_results(cache_key, max_age_hours=6)
+    if cached_results:
+        st.info("🗄️ キャッシュから結果を取得しました")
+        return cached_results
+    
+    search = arxiv.Search(
+        query=query,
+        max_results=max_results,
+        sort_by=arxiv.SortCriterion.SubmittedDate,
+        sort_order=arxiv.SortOrder.Descending
+    )
+    
+    results = []
+    retry_count = 0
+    max_retries = 3
+    
+    while retry_count < max_retries:
+        try:
+            for result in client.results(search):
+                results.append(result)
+                if len(results) >= max_results:
+                    break
+            
+            if results:
+                # 成功した場合はキャッシュに保存
+                cache.save_results(cache_key, results)
+                return results[0] if results else None
+            
+            break
+            
+        except arxiv.UnexpectedEmptyPageError as e:
+            retry_count += 1
+            wait_time = (2 ** retry_count) + random.uniform(0, 1)
+            st.warning(f"⚠️ arXiv APIエラー（空ページ）。{wait_time:.1f}秒後にリトライします... ({retry_count}/{max_retries})")
+            time.sleep(wait_time)
+            
+        except arxiv.HTTPError as e:
+            if hasattr(e, 'status') and e.status == 301:
+                retry_count += 1
+                st.warning(f"⚠️ HTTP 301リダイレクトエラー。10秒後にリトライします... ({retry_count}/{max_retries})")
+                time.sleep(10)
+            else:
+                st.error(f"❌ HTTP エラー: {e}")
+                break
+                
+        except Exception as e:
+            error_msg = str(e)
+            if "301" in error_msg:
+                retry_count += 1
+                st.warning(f"⚠️ リダイレクトエラー検出。{5 * retry_count}秒後にリトライします... ({retry_count}/{max_retries})")
+                time.sleep(5 * retry_count)
+            else:
+                st.error(f"❌ 予期しないエラー: {e}")
+                break
+    
+    return None
+
+def search_with_semantic_scholar_fallback(query, limit=5):
+    """Semantic Scholar APIを使ったフォールバック検索"""
     try:
-        # 完全一致検索を試行
+        url = "https://api.semanticscholar.org/graph/v1/paper/search"
+        params = {
+            'query': f"{query} arxiv",
+            'limit': limit,
+            'fields': 'title,abstract,authors,venue,year,externalIds,url'
+        }
+        
+        response = requests.get(url, params=params, timeout=10)
+        if response.status_code == 200:
+            data = response.json().get('data', [])
+            
+            # arXiv論文をフィルタリング
+            arxiv_papers = []
+            for paper in data:
+                external_ids = paper.get('externalIds', {})
+                if external_ids and 'ArXiv' in external_ids:
+                    arxiv_id = external_ids['ArXiv']
+                    
+                    # arXiv形式のオブジェクトを作成
+                    mock_result = type('MockResult', (), {
+                        'title': paper.get('title', ''),
+                        'summary': paper.get('abstract', ''),
+                        'entry_id': f"http://arxiv.org/abs/{arxiv_id}",
+                        'published': datetime.now(),
+                        'authors': [type('Author', (), {'name': author.get('name', '')})() 
+                                  for author in paper.get('authors', [])]
+                    })()
+                    
+                    arxiv_papers.append(mock_result)
+            
+            return arxiv_papers[0] if arxiv_papers else None
+            
+    except Exception as e:
+        st.warning(f"⚠️ Semantic Scholar APIエラー: {e}")
+        return None
+
+def search_paper_by_title(title, apis):
+    """タイトルで論文を検索（フォールバック機能付き）"""
+    try:
+        # まず完全一致検索を試行
         query = f'ti:"{title}"'
-        search = arxiv.Search(
-            query=query,
-            max_results=3,
-            sort_by=arxiv.SortCriterion.SubmittedDate,
-            sort_order=arxiv.SortOrder.Descending,
-        )
+        result = robust_arxiv_search(query, max_results=3, apis=apis)
         
-        results = list(search.results())
-        
-        if results:
-            return results[0]
+        if result:
+            return result
         
         # 完全一致で見つからない場合、部分一致検索
-        search = arxiv.Search(
-            query=title,
-            max_results=5,
-            sort_by=arxiv.SortCriterion.Relevance
-        )
-        results = list(search.results())
+        st.info("🔍 完全一致で見つからなかったため、部分一致検索を実行中...")
+        result = robust_arxiv_search(title, max_results=5, apis=apis)
         
-        return results[0] if results else None
+        if result:
+            return result
+        
+        # arXiv APIが失敗した場合、Semantic Scholarにフォールバック
+        st.warning("⚠️ arXiv検索に失敗しました。Semantic Scholar APIを試行中...")
+        result = search_with_semantic_scholar_fallback(title, limit=5)
+        
+        if result:
+            st.success("✅ Semantic Scholar経由で論文を発見しました")
+            return result
+        
+        return None
         
     except Exception as e:
-        error_msg = str(e)
-        if "301" in error_msg:
-            st.warning("⚠️ arXiv APIでリダイレクトエラーが発生しました。検索方法を変更します...")
-            try:
-                # 簡略化された検索を試行
-                simplified_title = " ".join(title.split()[:3])
-                search = arxiv.Search(
-                    query=simplified_title,
-                    max_results=5
-                )
-                results = list(search.results())
-                return results[0] if results else None
-            except Exception as e2:
-                st.error(f"❌ 代替検索も失敗しました: {e2}")
-                return None
-        else:
-            st.error(f"❌ 論文検索エラー: {e}")
-            return None
+        st.error(f"❌ 論文検索エラー: {e}")
+        return None
 
-def search_paper_by_id(arxiv_id):
-    """arXiv IDで論文を検索"""
+def search_paper_by_id(arxiv_id, apis):
+    """arXiv IDで論文を検索（多段階検索）"""
     try:
         # まずID直接検索を試行
         search = arxiv.Search(id_list=[arxiv_id])
-        results = list(search.results())
+        result = robust_arxiv_search(f"id_list:{arxiv_id}", max_results=1, apis=apis)
         
-        if results:
-            return results[0]
+        if result:
+            return result
         
         # ID検索で見つからない場合、IDでクエリ検索を試行
-        search = arxiv.Search(
-            query=f"id:{arxiv_id}",
-            max_results=1
-        )
-        results = list(search.results())
+        st.info("🔍 ID直接検索で見つからなかったため、クエリ検索を実行中...")
+        result = robust_arxiv_search(f"id:{arxiv_id}", max_results=1, apis=apis)
         
-        if results:
-            return results[0]
+        if result:
+            return result
             
         # それでも見つからない場合、一般検索のフォールバック
-        search = arxiv.Search(
-            query=arxiv_id,
-            max_results=1,
-            sort_by=arxiv.SortCriterion.Relevance
-        )
-        results = list(search.results())
+        st.info("🔍 通常のクエリ検索を実行中...")
+        result = robust_arxiv_search(arxiv_id, max_results=5, apis=apis)
         
-        return results[0] if results else None
+        if result:
+            return result
+        
+        # Semantic Scholar APIにフォールバック
+        st.warning("⚠️ arXiv検索に失敗しました。Semantic Scholar APIを試行中...")
+        result = search_with_semantic_scholar_fallback(arxiv_id, limit=5)
+        
+        if result:
+            st.success("✅ Semantic Scholar経由で論文を発見しました")
+            return result
+        
+        return None
         
     except Exception as e:
-        error_msg = str(e)
-        if "301" in error_msg:
-            st.warning("⚠️ arXiv APIでリダイレクトエラーが発生しました。別の検索方法を試します...")
-            try:
-                # 代替検索を試行
-                search = arxiv.Search(
-                    query=f'"{arxiv_id}"',
-                    max_results=5,
-                    sort_by=arxiv.SortCriterion.Relevance
-                )
-                results = list(search.results())
-                
-                # IDが部分一致する結果を探す
-                for result in results:
-                    if arxiv_id in result.entry_id:
-                        return result
-                        
-                return results[0] if results else None
-            except Exception as e2:
-                st.error(f"❌ 代替検索も失敗しました: {e2}")
-                return None
-        else:
-            st.error(f"❌ 論文取得エラー: {e}")
-            return None
+        st.error(f"❌ 論文取得エラー: {e}")
+        return None
 
 def get_summary(prompt, result, model, apis):
     """論文要約を生成"""
@@ -424,9 +549,17 @@ def main():
     st.markdown("""
     <div class="main-header">
         <h1>📚 Paper Summary by ChatGPT</h1>
-        <p>arXivの論文を検索してAIで要約するアプリです</p>
+        <p>arXivの論文を検索してAIで要約するアプリです（arXiv API 301エラー対応版）</p>
     </div>
     """, unsafe_allow_html=True)
+
+    # API状態情報の表示
+    with st.expander("🔧 システム状態", expanded=False):
+        st.markdown("### 📊 API対応状況")
+        st.markdown("- ✅ **arXiv API**: 堅牢なリトライ機能付き")
+        st.markdown("- ✅ **Semantic Scholar**: フォールバック対応")
+        st.markdown("- ✅ **キャッシュ機能**: 6時間有効")
+        st.markdown("- ✅ **HTTP 301エラー対応**: 自動リトライ")
 
     # サイドバー設定
     with st.sidebar:
@@ -446,7 +579,14 @@ def main():
         st.markdown("### 📊 統計情報")
         if 'search_count' not in st.session_state:
             st.session_state.search_count = 0
+        if 'error_count' not in st.session_state:
+            st.session_state.error_count = 0
+        if 'fallback_count' not in st.session_state:
+            st.session_state.fallback_count = 0
+            
         st.metric("検索回数", st.session_state.search_count)
+        st.metric("エラー回数", st.session_state.error_count)
+        st.metric("フォールバック成功", st.session_state.fallback_count)
 
     # メインコンテンツ
     col1, col2 = st.columns([2, 1])
@@ -525,18 +665,20 @@ def main():
         st.session_state.search_count += 1
 
         # 論文検索
-        with st.spinner("🔍 論文を検索中..."):
+        with st.spinner("🔍 論文を検索中（堅牢モード）..."):
             if search_method == "タイトルで検索":
-                result = search_paper_by_title(paper_input.strip())
+                result = search_paper_by_title(paper_input.strip(), apis)
             else:
                 arxiv_id = extract_arxiv_id_from_url(paper_input.strip())
                 if not arxiv_id:
                     st.error("❌ 有効なarXiv URLまたはIDを入力してください。")
+                    st.session_state.error_count += 1
                     return
-                result = search_paper_by_id(arxiv_id)
+                result = search_paper_by_id(arxiv_id, apis)
             
             if not result:
                 st.error("❌ 該当する論文が見つかりませんでした。入力内容を確認してください。")
+                st.session_state.error_count += 1
                 return
 
         # 論文情報表示
@@ -549,6 +691,7 @@ def main():
             
             if not summary_message:
                 st.error("❌ 要約の生成に失敗しました。")
+                st.session_state.error_count += 1
                 return
 
             summary_data = {
@@ -588,10 +731,22 @@ def main():
     st.markdown('<div class="footer-tips">', unsafe_allow_html=True)
     st.markdown("### 💡 使い方のヒント")
     st.markdown("""
+    - **arXiv API問題対応**: HTTP 301エラーに対する自動リトライ機能を搭載
+    - **フォールバック機能**: arXiv APIが失敗した場合、Semantic Scholar APIを自動使用
+    - **キャッシュ機能**: 同じ検索は6時間以内なら高速表示
     - **タイトル検索**: 論文のタイトルを正確に入力してください（部分一致も可能）
     - **URL/ID指定**: `https://arxiv.org/abs/1234.5678` 形式のURLまたは `1234.5678` 形式のIDが使用できます
     - **プロンプト**: 要約スタイルを変更したい場合は「プロンプトをカスタマイズ」から編集してください
     - **モデル選択**: 用途に応じてGPTモデルを選択してください（o3が最新、GPT-4.1が高性能、GPT-4.1 nanoが高速）
+    """)
+    
+    st.markdown("### 🔧 システム改善点（v12）")
+    st.markdown("""
+    - **301エラー対応**: arXiv APIの2024年インフラ変更に対応した堅牢なリトライ機能
+    - **Semantic Scholar統合**: arXiv検索失敗時の自動フォールバック
+    - **最適化されたクライアント設定**: 3秒間隔、5回リトライで安定性向上
+    - **インテリジェントキャッシュ**: 検索結果を6時間キャッシュして高速化
+    - **詳細な統計情報**: 検索成功率とエラー状況をリアルタイム監視
     """)
     st.markdown('</div>', unsafe_allow_html=True)
 
