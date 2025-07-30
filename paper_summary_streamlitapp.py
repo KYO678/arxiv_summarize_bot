@@ -152,11 +152,11 @@ class ArxivCache:
         
         return None
     
-    def save_results(self, query, results):
+    def save_results(self, query, result):
         cache_path = os.path.join(self.cache_dir, f"{hash(query)}.pkl")
         try:
             with open(cache_path, 'wb') as f:
-                pickle.dump(results, f)
+                pickle.dump(result, f)
         except Exception as e:
             st.warning(f"キャッシュ保存に失敗: {e}")
 
@@ -219,23 +219,24 @@ def extract_arxiv_id_from_url(url):
     except Exception:
         return None
 
-def robust_arxiv_search(query, max_results=5, apis=None):
+def robust_arxiv_search(query, max_results=5, apis=None, id_list=None):
     """堅牢なarXiv検索（301エラー対応）"""
     if not apis:
         return None
-        
+
     client = apis["arxiv_client"]
     cache = apis["cache"]
-    
+
     # キャッシュから検索
-    cache_key = f"{query}_{max_results}"
-    cached_results = cache.get_cached_results(cache_key, max_age_hours=6)
-    if cached_results:
+    cache_key = f"{query}_{max_results}_{'_'.join(id_list) if id_list else ''}"
+    cached_result = cache.get_cached_results(cache_key, max_age_hours=6)
+    if cached_result:
         st.info("🗄️ キャッシュから結果を取得しました")
-        return cached_results
-    
+        return cached_result
+
     search = arxiv.Search(
         query=query,
+        id_list=id_list,
         max_results=max_results,
         sort_by=arxiv.SortCriterion.SubmittedDate,
         sort_order=arxiv.SortOrder.Descending
@@ -254,8 +255,8 @@ def robust_arxiv_search(query, max_results=5, apis=None):
             
             if results:
                 # 成功した場合はキャッシュに保存
-                cache.save_results(cache_key, results)
-                return results[0] if results else None
+                cache.save_results(cache_key, results[0])
+                return results[0]
             
             break
             
@@ -360,9 +361,8 @@ def search_paper_by_id(arxiv_id, apis):
     """arXiv IDで論文を検索（多段階検索）"""
     try:
         # まずID直接検索を試行
-        search = arxiv.Search(id_list=[arxiv_id])
-        result = robust_arxiv_search(f"id_list:{arxiv_id}", max_results=1, apis=apis)
-        
+        result = robust_arxiv_search("", max_results=1, apis=apis, id_list=[arxiv_id])
+
         if result:
             return result
         
