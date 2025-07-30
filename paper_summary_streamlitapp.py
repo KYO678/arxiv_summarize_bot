@@ -219,23 +219,27 @@ def extract_arxiv_id_from_url(url):
     except Exception:
         return None
 
-def robust_arxiv_search(query, max_results=5, apis=None):
+def robust_arxiv_search(query=None, id_list=None, max_results=5, apis=None):
     """堅牢なarXiv検索（301エラー対応）"""
     if not apis:
         return None
-        
+
     client = apis["arxiv_client"]
     cache = apis["cache"]
-    
+
+    # キャッシュキーを作成
+    cache_id = query if query is not None else ",".join(id_list or [])
+    cache_key = f"{cache_id}_{max_results}"
+
     # キャッシュから検索
-    cache_key = f"{query}_{max_results}"
     cached_results = cache.get_cached_results(cache_key, max_age_hours=6)
     if cached_results:
         st.info("🗄️ キャッシュから結果を取得しました")
         return cached_results
-    
+
     search = arxiv.Search(
         query=query,
+        id_list=id_list,
         max_results=max_results,
         sort_by=arxiv.SortCriterion.SubmittedDate,
         sort_order=arxiv.SortOrder.Descending
@@ -360,8 +364,7 @@ def search_paper_by_id(arxiv_id, apis):
     """arXiv IDで論文を検索（多段階検索）"""
     try:
         # まずID直接検索を試行
-        search = arxiv.Search(id_list=[arxiv_id])
-        result = robust_arxiv_search(f"id_list:{arxiv_id}", max_results=1, apis=apis)
+        result = robust_arxiv_search(id_list=[arxiv_id], max_results=1, apis=apis)
         
         if result:
             return result
