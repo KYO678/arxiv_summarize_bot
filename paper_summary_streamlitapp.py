@@ -11,6 +11,7 @@ import requests
 from datetime import datetime, timedelta
 import pickle
 import os
+import hashlib
 
 # ページ設定
 st.set_page_config(
@@ -137,8 +138,13 @@ class ArxivCache:
         self.cache_dir = cache_dir
         os.makedirs(cache_dir, exist_ok=True)
     
+    def _cache_path(self, query: str) -> str:
+        """Return a stable cache path for the given query."""
+        digest = hashlib.sha256(query.encode("utf-8")).hexdigest()
+        return os.path.join(self.cache_dir, f"{digest}.pkl")
+
     def get_cached_results(self, query, max_age_hours=24):
-        cache_path = os.path.join(self.cache_dir, f"{hash(query)}.pkl")
+        cache_path = self._cache_path(query)
         
         if os.path.exists(cache_path):
             mtime = datetime.fromtimestamp(os.path.getmtime(cache_path))
@@ -153,7 +159,7 @@ class ArxivCache:
         return None
     
     def save_results(self, query, result):
-        cache_path = os.path.join(self.cache_dir, f"{hash(query)}.pkl")
+        cache_path = self._cache_path(query)
         try:
             with open(cache_path, 'wb') as f:
                 pickle.dump(result, f)
@@ -365,31 +371,24 @@ def search_paper_by_id(arxiv_id, apis):
 
         if result:
             return result
-        
-        # ID検索で見つからない場合、IDでクエリ検索を試行
-        st.info("🔍 ID直接検索で見つからなかったため、クエリ検索を実行中...")
-        result = robust_arxiv_search(f"id:{arxiv_id}", max_results=1, apis=apis)
-        
-        if result:
-            return result
-            
-        # それでも見つからない場合、一般検索のフォールバック
-        st.info("🔍 通常のクエリ検索を実行中...")
+
+        # ID検索で見つからない場合、一般検索を試行
+        st.info("🔍 ID直接検索で見つからなかったため、通常のクエリ検索を実行中...")
         result = robust_arxiv_search(arxiv_id, max_results=5, apis=apis)
-        
+
         if result:
             return result
-        
+
         # Semantic Scholar APIにフォールバック
         st.warning("⚠️ arXiv検索に失敗しました。Semantic Scholar APIを試行中...")
         result = search_with_semantic_scholar_fallback(arxiv_id, limit=5)
-        
+
         if result:
             st.success("✅ Semantic Scholar経由で論文を発見しました")
             return result
-        
+
         return None
-        
+
     except Exception as e:
         st.error(f"❌ 論文取得エラー: {e}")
         return None
