@@ -1,17 +1,16 @@
 import streamlit as st
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
-import arxiv
 import openai
 from notion_client import Client
 import re
 import time
 import random
 import requests
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 import pickle
 import os
-import hashlib
 
 # ページ設定
 st.set_page_config(
@@ -108,6 +107,7 @@ st.markdown("""
 # 定数
 SLACK_CHANNEL = "#news-bot1"
 CACHE_DIR = "arxiv_cache"
+ARXIV_API_BASE = "http://export.arxiv.org/api/query"
 
 GPT_MODELS = {
     "GPT-4o": "gpt-4o-2024-08-06",
@@ -132,19 +132,39 @@ DEFAULT_PROMPT = """まず、与えられた論文の背景となっていた課
 ```
 """
 
-# キャッシュクラス
-class ArxivCache:
+# 改良されたarXiv検索クラス
+class ImprovedArxivSearch:
     def __init__(self, cache_dir=CACHE_DIR):
+        self.api_base = ARXIV_API_BASE
         self.cache_dir = cache_dir
         os.makedirs(cache_dir, exist_ok=True)
     
-    def _cache_path(self, query: str) -> str:
-        """Return a stable cache path for the given query."""
-        digest = hashlib.sha256(query.encode("utf-8")).hexdigest()
-        return os.path.join(self.cache_dir, f"{digest}.pkl")
-
-    def get_cached_results(self, query, max_age_hours=24):
-        cache_path = self._cache_path(query)
+    def extract_arxiv_id_from_url(self, url):
+        """arXiv URLからIDを抽出する"""
+        try:
+            patterns = [
+                r'arxiv\.org/abs/([0-9]{4}\.[0-9]{4,5}v?[0-9]*)',
+                r'arxiv\.org/pdf/([0-9]{4}\.[0-9]{4,5}v?[0-9]*)\.pdf',
+                r'^([0-9]{4}\.[0-9]{4,5}v?[0-9]*)$',
+                r'arxiv\.org/abs/([a-z-]+/[0-9]{7})',  # 古い形式
+                r'arxiv\.org/pdf/([a-z-]+/[0-9]{7})'   # 古い形式
+            ]
+            
+            for pattern in patterns:
+                match = re.search(pattern, url)
+                if match:
+                    arxiv_id = match.group(1)
+                    # バージョン番号を削除
+                    arxiv_id = re.sub(r'v\d+$', '', arxiv_id)
+                    return arxiv_id
+            
+            return None
+        except Exception:
+            return None
+    
+    def get_cached_results(self, query, max_age_hours=6):
+        """キャッシュから結果を取得"""
+        cache_path = os.path.join(self.cache_dir, f"{hash(query)}.pkl")
         
         if os.path.exists(cache_path):
             mtime = datetime.fromtimestamp(os.path.getmtime(cache_path))
@@ -153,16 +173,202 @@ class ArxivCache:
                     with open(cache_path, 'rb') as f:
                         return pickle.load(f)
                 except Exception:
-                    # キャッシュファイルが破損している場合は削除
                     os.remove(cache_path)
         
         return None
     
-    def save_results(self, query, result):
-        cache_path = self._cache_path(query)
+    def save_results(self, query, results):
+        """結果をキャッシュに保存"""
+        cache_path = os.path.join(self.cache_dir, f"{hash(query)}.pkl")
         try:
             with open(cache_path, 'wb') as f:
-                pickle.dump(result, f)
+                pickle.dump(results, f)
+        except Exception as e:
+            st.warning(f"キャッシュ保存に失敗: {e}")
+    
+    def search_arxiv_api(self, query, max_results=5, retry_count=3):
+        """直接arXiv APIで検索"""
+        params = {
+            'search_query': query,
+            'max_results': max_results,
+            'sortBy': 'submittedDate',
+            'sortOrder': 'descending'
+        }
+        
+        for attempt in range(retry_count):
+            try:
+                response = requests.get(self.api_base, params=params, timeout=30)
+                response.raise_for_status()
+                
+                # XMLパース
+                root = ET.fromstring(response.content)
+                
+                # 名前空間の設定
+                namespaces = {
+                    'atom': 'http://www.w3.org/2005/Atom',
+                    'arxiv': 'http://arxiv.org/schemas/atom'
+                }
+                
+                entries = root.findall('atom:entry', namespaces)
+                if not entries:
+                    return None
+                
+                # 最初のエントリを取得
+                entry = entries[0]
+                
+                # メタデータの抽出
+                paper_data = {
+                    'id': entry.find('atom:id', namespaces).text.split('/')[-1],
+                    'title': entry.find('atom:title', namespaces).text.strip(),
+                    'summary': entry.find('atom:summary', namespaces).text.strip(),
+                    'published': entry.find('atom:published', namespaces).text,
+                    'updated': entry.find('atom:updated', namespaces).text,
+                    'authors': [author.find('atom:name', namespaces).text 
+                               for author in entry.findall('atom:author', namespaces)],
+                    'categories': [cat.get('term') 
+                                  for cat in entry.findall('atom:category', namespaces)]
+                }
+                
+                # URL情報を追加
+                paper_data['entry_id'] = f"http://arxiv.org/abs/{paper_data['id']}"
+                paper_data['pdf_url'] = f"http://arxiv.org/pdf/{paper_data['id']}.pdf"
+                
+                # 日付情報をdatetimeオブジェクトに変換
+                try:
+                    paper_data['published_datetime'] = datetime.fromisoformat(paper_data['published'].replace('Z', '+00:00'))
+                except:
+                    paper_data['published_datetime'] = datetime.now()
+                
+                return paper_data
+                
+            except requests.RequestException as e:
+                wait_time = (2 ** attempt) + random.uniform(0, 1)
+                if attempt < retry_count - 1:
+                    st.warning(f"⚠️ API接続エラー（{attempt + 1}/{retry_count}）。{wait_time:.1f}秒後にリトライします...")
+                    time.sleep(wait_time)
+                else:
+                    st.error(f"❌ API接続に失敗しました: {e}")
+                    
+            except ET.ParseError as e:
+                st.error(f"❌ XMLパースエラー: {e}")
+                break
+                
+        return None
+    
+    def search_by_id(self, arxiv_id):
+        """IDで論文を検索"""
+        cache_key = f"id:{arxiv_id}"
+        cached_result = self.get_cached_results(cache_key)
+        if cached_result:
+            st.info("🗄️ キャッシュから結果を取得しました")
+            return cached_result
+        
+        # ID検索用のパラメータ
+        params = {
+            'id_list': arxiv_id,
+            'max_results': 1
+        }
+        
+        try:
+            response = requests.get(self.api_base, params=params, timeout=30)
+            response.raise_for_status()
+            
+            # XMLパース
+            root = ET.fromstring(response.content)
+            
+            # 名前空間の設定
+            namespaces = {
+                'atom': 'http://www.w3.org/2005/Atom',
+                'arxiv': 'http://arxiv.org/schemas/atom'
+            }
+            
+            entry = root.find('atom:entry', namespaces)
+            if entry is None:
+                return None
+            
+            # メタデータの抽出
+            paper_data = {
+                'id': entry.find('atom:id', namespaces).text.split('/')[-1],
+                'title': entry.find('atom:title', namespaces).text.strip(),
+                'summary': entry.find('atom:summary', namespaces).text.strip(),
+                'published': entry.find('atom:published', namespaces).text,
+                'updated': entry.find('atom:updated', namespaces).text,
+                'authors': [author.find('atom:name', namespaces).text 
+                           for author in entry.findall('atom:author', namespaces)],
+                'categories': [cat.get('term') 
+                              for cat in entry.findall('atom:category', namespaces)]
+            }
+            
+            # URL情報を追加
+            paper_data['entry_id'] = f"http://arxiv.org/abs/{paper_data['id']}"
+            paper_data['pdf_url'] = f"http://arxiv.org/pdf/{paper_data['id']}.pdf"
+            
+            # 日付情報をdatetimeオブジェクトに変換
+            try:
+                paper_data['published_datetime'] = datetime.fromisoformat(paper_data['published'].replace('Z', '+00:00'))
+            except:
+                paper_data['published_datetime'] = datetime.now()
+            
+            # キャッシュに保存
+            self.save_results(cache_key, paper_data)
+            
+            return paper_data
+            
+        except Exception as e:
+            st.error(f"❌ ID検索エラー: {e}")
+            return None
+    
+    def search_by_title(self, title):
+        """タイトルで論文を検索"""
+        cache_key = f"title:{title}"
+        cached_result = self.get_cached_results(cache_key)
+        if cached_result:
+            st.info("🗄️ キャッシュから結果を取得しました")
+            return cached_result
+        
+        # まず完全一致検索を試行
+        query = f'ti:"{title}"'
+        result = self.search_arxiv_api(query, max_results=3)
+        
+        if result:
+            self.save_results(cache_key, result)
+            return result
+        
+        # 完全一致で見つからない場合、部分一致検索
+        st.info("🔍 完全一致で見つからなかったため、部分一致検索を実行中...")
+        result = self.search_arxiv_api(f"all:{title}", max_results=5)
+        
+        if result:
+            self.save_results(cache_key, result)
+            return result
+        
+        return None
+
+# キャッシュクラス
+class ArxivCache:
+    def __init__(self, cache_dir=CACHE_DIR):
+        self.cache_dir = cache_dir
+        os.makedirs(cache_dir, exist_ok=True)
+    
+    def get_cached_results(self, query, max_age_hours=24):
+        cache_path = os.path.join(self.cache_dir, f"{hash(query)}.pkl")
+        
+        if os.path.exists(cache_path):
+            mtime = datetime.fromtimestamp(os.path.getmtime(cache_path))
+            if datetime.now() - mtime < timedelta(hours=max_age_hours):
+                try:
+                    with open(cache_path, 'rb') as f:
+                        return pickle.load(f)
+                except Exception:
+                    os.remove(cache_path)
+        
+        return None
+    
+    def save_results(self, query, results):
+        cache_path = os.path.join(self.cache_dir, f"{hash(query)}.pkl")
+        try:
+            with open(cache_path, 'wb') as f:
+                pickle.dump(results, f)
         except Exception as e:
             st.warning(f"キャッシュ保存に失敗: {e}")
 
@@ -180,215 +386,35 @@ def initialize_apis():
         notion_client = Client(auth=notion_key)
         slack_client = WebClient(token=slack_token)
         
-        # 最適化されたarXivクライアント設定
-        arxiv_client = arxiv.Client(
-            page_size=50,           # 小さめのページサイズで安定性向上
-            delay_seconds=3.0,      # arXiv推奨の3秒間隔
-            num_retries=5           # 充分なリトライ回数
-        )
+        # 改良されたarXiv検索クライアント
+        arxiv_search = ImprovedArxivSearch()
         
         return {
             "openai_key": openai_key,
             "slack_client": slack_client,
             "notion_client": notion_client,
             "notion_db_url": notion_db_url,
-            "arxiv_client": arxiv_client,
+            "arxiv_search": arxiv_search,
             "cache": ArxivCache()
         }
     except Exception as e:
         st.error(f"⚠️ 設定エラー: 必要なAPIキーが設定されていません。 {e}")
         st.stop()
 
-def extract_arxiv_id_from_url(url):
-    """arXiv URLからIDを抽出する"""
-    try:
-        # 各パターンを個別に定義
-        pattern1 = r'arxiv\.org/abs/([0-9]{4}\.[0-9]{4,5}v?[0-9]*)'
-        pattern2 = r'arxiv\.org/pdf/([0-9]{4}\.[0-9]{4,5}v?[0-9]*)\.pdf'
-        pattern3 = r'^([0-9]{4}\.[0-9]{4,5}v?[0-9]*)$'
-        
-        patterns = [pattern1, pattern2, pattern3]
-        
-        for pattern in patterns:
-            match = re.search(pattern, url)
-            if match:
-                arxiv_id = match.group(1)
-                # バージョン番号を削除
-                arxiv_id = re.sub(r'v\d+$', '', arxiv_id)
-                
-                # ID形式の検証
-                validation_pattern = r'^[0-9]{4}\.[0-9]{4,5}$'
-                if re.match(validation_pattern, arxiv_id):
-                    return arxiv_id
-                
-        return None
-    except Exception:
-        return None
-
-def robust_arxiv_search(query, max_results=5, apis=None, id_list=None):
-    """堅牢なarXiv検索（301エラー対応）"""
-    if not apis:
-        return None
-
-    client = apis["arxiv_client"]
-    cache = apis["cache"]
-
-    # キャッシュから検索
-    cache_key = f"{query}_{max_results}_{'_'.join(id_list) if id_list else ''}"
-    cached_result = cache.get_cached_results(cache_key, max_age_hours=6)
-    if cached_result:
-        st.info("🗄️ キャッシュから結果を取得しました")
-        return cached_result
-
-    search = arxiv.Search(
-        query=query,
-        id_list=id_list,
-        max_results=max_results,
-        sort_by=arxiv.SortCriterion.SubmittedDate,
-        sort_order=arxiv.SortOrder.Descending
-    )
-    
-    results = []
-    retry_count = 0
-    max_retries = 3
-    
-    while retry_count < max_retries:
-        try:
-            for result in client.results(search):
-                results.append(result)
-                if len(results) >= max_results:
-                    break
-            
-            if results:
-                # 成功した場合はキャッシュに保存
-                cache.save_results(cache_key, results[0])
-                return results[0]
-            
-            break
-            
-        except arxiv.UnexpectedEmptyPageError as e:
-            retry_count += 1
-            wait_time = (2 ** retry_count) + random.uniform(0, 1)
-            st.warning(f"⚠️ arXiv APIエラー（空ページ）。{wait_time:.1f}秒後にリトライします... ({retry_count}/{max_retries})")
-            time.sleep(wait_time)
-            
-        except arxiv.HTTPError as e:
-            if hasattr(e, 'status') and e.status == 301:
-                retry_count += 1
-                st.warning(f"⚠️ HTTP 301リダイレクトエラー。10秒後にリトライします... ({retry_count}/{max_retries})")
-                time.sleep(10)
-            else:
-                st.error(f"❌ HTTP エラー: {e}")
-                break
-                
-        except Exception as e:
-            error_msg = str(e)
-            if "301" in error_msg:
-                retry_count += 1
-                st.warning(f"⚠️ リダイレクトエラー検出。{5 * retry_count}秒後にリトライします... ({retry_count}/{max_retries})")
-                time.sleep(5 * retry_count)
-            else:
-                st.error(f"❌ 予期しないエラー: {e}")
-                break
-    
-    return None
-
-def search_with_semantic_scholar_fallback(query, limit=5):
-    """Semantic Scholar APIを使ったフォールバック検索"""
-    try:
-        url = "https://api.semanticscholar.org/graph/v1/paper/search"
-        params = {
-            'query': f"{query} arxiv",
-            'limit': limit,
-            'fields': 'title,abstract,authors,venue,year,externalIds,url'
-        }
-        
-        response = requests.get(url, params=params, timeout=10)
-        if response.status_code == 200:
-            data = response.json().get('data', [])
-            
-            # arXiv論文をフィルタリング
-            arxiv_papers = []
-            for paper in data:
-                external_ids = paper.get('externalIds', {})
-                if external_ids and 'ArXiv' in external_ids:
-                    arxiv_id = external_ids['ArXiv']
-                    
-                    # arXiv形式のオブジェクトを作成
-                    mock_result = type('MockResult', (), {
-                        'title': paper.get('title', ''),
-                        'summary': paper.get('abstract', ''),
-                        'entry_id': f"http://arxiv.org/abs/{arxiv_id}",
-                        'published': datetime.now(),
-                        'authors': [type('Author', (), {'name': author.get('name', '')})() 
-                                  for author in paper.get('authors', [])]
-                    })()
-                    
-                    arxiv_papers.append(mock_result)
-            
-            return arxiv_papers[0] if arxiv_papers else None
-            
-    except Exception as e:
-        st.warning(f"⚠️ Semantic Scholar APIエラー: {e}")
-        return None
-
 def search_paper_by_title(title, apis):
-    """タイトルで論文を検索（フォールバック機能付き）"""
+    """タイトルで論文を検索"""
     try:
-        # まず完全一致検索を試行
-        query = f'ti:"{title}"'
-        result = robust_arxiv_search(query, max_results=3, apis=apis)
-        
-        if result:
-            return result
-        
-        # 完全一致で見つからない場合、部分一致検索
-        st.info("🔍 完全一致で見つからなかったため、部分一致検索を実行中...")
-        result = robust_arxiv_search(title, max_results=5, apis=apis)
-        
-        if result:
-            return result
-        
-        # arXiv APIが失敗した場合、Semantic Scholarにフォールバック
-        st.warning("⚠️ arXiv検索に失敗しました。Semantic Scholar APIを試行中...")
-        result = search_with_semantic_scholar_fallback(title, limit=5)
-        
-        if result:
-            st.success("✅ Semantic Scholar経由で論文を発見しました")
-            return result
-        
-        return None
-        
+        result = apis["arxiv_search"].search_by_title(title)
+        return result
     except Exception as e:
         st.error(f"❌ 論文検索エラー: {e}")
         return None
 
 def search_paper_by_id(arxiv_id, apis):
-    """arXiv IDで論文を検索（多段階検索）"""
+    """arXiv IDで論文を検索"""
     try:
-        # まずID直接検索を試行
-        result = robust_arxiv_search("", max_results=1, apis=apis, id_list=[arxiv_id])
-
-        if result:
-            return result
-
-        # ID検索で見つからない場合、一般検索を試行
-        st.info("🔍 ID直接検索で見つからなかったため、通常のクエリ検索を実行中...")
-        result = robust_arxiv_search(arxiv_id, max_results=5, apis=apis)
-
-        if result:
-            return result
-
-        # Semantic Scholar APIにフォールバック
-        st.warning("⚠️ arXiv検索に失敗しました。Semantic Scholar APIを試行中...")
-        result = search_with_semantic_scholar_fallback(arxiv_id, limit=5)
-
-        if result:
-            st.success("✅ Semantic Scholar経由で論文を発見しました")
-            return result
-
-        return None
-
+        result = apis["arxiv_search"].search_by_id(arxiv_id)
+        return result
     except Exception as e:
         st.error(f"❌ 論文取得エラー: {e}")
         return None
@@ -399,7 +425,7 @@ def get_summary(prompt, result, model, apis):
         st.error("❌ プロンプトが空です。")
         return None
         
-    text = f"title: {result.title}\nbody: {result.summary}"
+    text = f"title: {result['title']}\nbody: {result['summary']}"
     
     try:
         # 新しいOpenAI API形式
@@ -435,9 +461,9 @@ def get_summary(prompt, result, model, apis):
         st.error("❌ 要約が生成されませんでした。")
         return None
     
-    title_en = result.title
-    date_str = result.published.strftime("%Y-%m-%d %H:%M:%S")
-    message = f"発行日: {date_str}\n{result.entry_id}\n{title_en}\n\n{summary}\n"
+    title_en = result['title']
+    date_str = result['published_datetime'].strftime("%Y-%m-%d %H:%M:%S")
+    message = f"発行日: {date_str}\n{result['entry_id']}\n{title_en}\n\n{summary}\n"
 
     return message
 
@@ -523,20 +549,22 @@ def display_paper_info(result):
     st.markdown('<div class="paper-info-box">', unsafe_allow_html=True)
     st.markdown("### 📄 論文情報")
     
-    st.write(f"**タイトル:** {result.title}")
-    st.write(f"**発行日:** {result.published.strftime('%Y-%m-%d')}")
-    st.write(f"**URL:** {result.entry_id}")
+    st.write(f"**タイトル:** {result['title']}")
+    st.write(f"**発行日:** {result['published_datetime'].strftime('%Y-%m-%d')}")
+    st.write(f"**URL:** {result['entry_id']}")
     
     try:
-        authors = [author.name for author in result.authors if author.name]
-        if authors:
-            displayed_authors = authors[:10]
+        if result['authors']:
+            displayed_authors = result['authors'][:10]
             author_text = ", ".join(displayed_authors)
-            if len(authors) > 10:
-                author_text += f" 他 {len(authors) - 10} 名"
+            if len(result['authors']) > 10:
+                author_text += f" 他 {len(result['authors']) - 10} 名"
             st.write(f"**著者:** {author_text}")
     except Exception:
         st.write("**著者:** 情報取得できませんでした")
+    
+    if result.get('categories'):
+        st.write(f"**カテゴリ:** {', '.join(result['categories'][:5])}")
     
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -548,17 +576,17 @@ def main():
     st.markdown("""
     <div class="main-header">
         <h1>📚 Paper Summary by ChatGPT</h1>
-        <p>arXivの論文を検索してAIで要約するアプリです（arXiv API 301エラー対応版）</p>
+        <p>arXivの論文を検索してAIで要約するアプリです（直接API対応版）</p>
     </div>
     """, unsafe_allow_html=True)
 
     # API状態情報の表示
     with st.expander("🔧 システム状態", expanded=False):
         st.markdown("### 📊 API対応状況")
-        st.markdown("- ✅ **arXiv API**: 堅牢なリトライ機能付き")
-        st.markdown("- ✅ **Semantic Scholar**: フォールバック対応")
+        st.markdown("- ✅ **arXiv API**: 直接HTTP API経由で安定動作")
         st.markdown("- ✅ **キャッシュ機能**: 6時間有効")
-        st.markdown("- ✅ **HTTP 301エラー対応**: 自動リトライ")
+        st.markdown("- ✅ **XML パース**: 確実なデータ取得")
+        st.markdown("- ✅ **自動リトライ**: 接続エラー時の自動復旧")
 
     # サイドバー設定
     with st.sidebar:
@@ -580,12 +608,12 @@ def main():
             st.session_state.search_count = 0
         if 'error_count' not in st.session_state:
             st.session_state.error_count = 0
-        if 'fallback_count' not in st.session_state:
-            st.session_state.fallback_count = 0
+        if 'cache_hits' not in st.session_state:
+            st.session_state.cache_hits = 0
             
         st.metric("検索回数", st.session_state.search_count)
         st.metric("エラー回数", st.session_state.error_count)
-        st.metric("フォールバック成功", st.session_state.fallback_count)
+        st.metric("キャッシュヒット", st.session_state.cache_hits)
 
     # メインコンテンツ
     col1, col2 = st.columns([2, 1])
@@ -664,11 +692,11 @@ def main():
         st.session_state.search_count += 1
 
         # 論文検索
-        with st.spinner("🔍 論文を検索中（堅牢モード）..."):
+        with st.spinner("🔍 論文を検索中（直接API経由）..."):
             if search_method == "タイトルで検索":
                 result = search_paper_by_title(paper_input.strip(), apis)
             else:
-                arxiv_id = extract_arxiv_id_from_url(paper_input.strip())
+                arxiv_id = apis["arxiv_search"].extract_arxiv_id_from_url(paper_input.strip())
                 if not arxiv_id:
                     st.error("❌ 有効なarXiv URLまたはIDを入力してください。")
                     st.session_state.error_count += 1
@@ -694,10 +722,10 @@ def main():
                 return
 
             summary_data = {
-                "title": result.title,
+                "title": result['title'],
                 "summary": summary_message,
-                "url": result.entry_id,
-                "date": result.published.strftime("%Y-%m-%d"),
+                "url": result['entry_id'],
+                "date": result['published_datetime'].strftime("%Y-%m-%d"),
             }
 
         # 結果表示
@@ -730,8 +758,8 @@ def main():
     st.markdown('<div class="footer-tips">', unsafe_allow_html=True)
     st.markdown("### 💡 使い方のヒント")
     st.markdown("""
-    - **arXiv API問題対応**: HTTP 301エラーに対する自動リトライ機能を搭載
-    - **フォールバック機能**: arXiv APIが失敗した場合、Semantic Scholar APIを自動使用
+    - **直接API対応**: arXiv公式APIを直接HTTP経由で呼び出すため安定動作
+    - **XMLパース**: 確実なデータ取得のためのXML解析
     - **キャッシュ機能**: 同じ検索は6時間以内なら高速表示
     - **タイトル検索**: 論文のタイトルを正確に入力してください（部分一致も可能）
     - **URL/ID指定**: `https://arxiv.org/abs/1234.5678` 形式のURLまたは `1234.5678` 形式のIDが使用できます
@@ -739,13 +767,15 @@ def main():
     - **モデル選択**: 用途に応じてGPTモデルを選択してください（o3が最新、GPT-4.1が高性能、GPT-4.1 nanoが高速）
     """)
     
-    st.markdown("### 🔧 システム改善点（v12）")
+    st.markdown("### 🔧 システム改善点（v13 - 直接API版）")
     st.markdown("""
-    - **301エラー対応**: arXiv APIの2024年インフラ変更に対応した堅牢なリトライ機能
-    - **Semantic Scholar統合**: arXiv検索失敗時の自動フォールバック
-    - **最適化されたクライアント設定**: 3秒間隔、5回リトライで安定性向上
-    - **インテリジェントキャッシュ**: 検索結果を6時間キャッシュして高速化
-    - **詳細な統計情報**: 検索成功率とエラー状況をリアルタイム監視
+    - **直接HTTP API**: arxivライブラリを使わず、arXiv公式APIを直接呼び出し
+    - **XML解析**: ElementTreeによる確実なレスポンス解析
+    - **ID検索**: id_listパラメータによる正確なID検索
+    - **タイトル検索**: ti:フィールドによる精密なタイトル検索とフォールバック
+    - **キャッシュ最適化**: 検索結果を6時間キャッシュして高速化
+    - **エラーハンドリング**: 接続エラー時の自動リトライ機能
+    - **統計情報**: 検索成功率とキャッシュヒット率をリアルタイム監視
     """)
     st.markdown('</div>', unsafe_allow_html=True)
 
