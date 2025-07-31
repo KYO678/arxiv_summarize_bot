@@ -377,17 +377,48 @@ class ArxivCache:
 def initialize_apis():
     """API初期化（キャッシュ）"""
     try:
+        # API キーの取得とデバッグ
+        st.write("🔍 デバッグ: API初期化開始")
+        
         openai_key = st.secrets.gptApiKey.key
         slack_token = st.secrets.SlackApiKey.key
         notion_key = st.secrets.NotionApiKey.key
         notion_db_url = st.secrets.NotionDatabaseUrl.key
         
+        # キーの存在確認（実際の値は表示しない）
+        st.write(f"- OpenAI Key: {'✅ 設定済み' if openai_key else '❌ 未設定'}")
+        st.write(f"- Slack Token: {'✅ 設定済み' if slack_token else '❌ 未設定'}")
+        st.write(f"- Notion Key: {'✅ 設定済み' if notion_key else '❌ 未設定'}")
+        st.write(f"- Notion DB URL: {'✅ 設定済み' if notion_db_url else '❌ 未設定'}")
+        
+        # OpenAI初期化
         openai.api_key = openai_key
+        
+        # Notion初期化
         notion_client = Client(auth=notion_key)
+        
+        # Slack初期化
         slack_client = WebClient(token=slack_token)
         
         # 改良されたarXiv検索クライアント
         arxiv_search = ImprovedArxivSearch()
+        
+        # 接続テスト
+        st.write("🔍 デバッグ: API接続テスト")
+        
+        # Slack接続テスト
+        try:
+            slack_test = slack_client.auth_test()
+            st.write(f"- Slack: ✅ 接続成功 (User: {slack_test.get('user', 'Unknown')})")
+        except Exception as e:
+            st.write(f"- Slack: ❌ 接続失敗 ({str(e)})")
+        
+        # Notion接続テスト
+        try:
+            notion_test = notion_client.users.me()
+            st.write(f"- Notion: ✅ 接続成功 (User: {notion_test.get('name', 'Unknown')})")
+        except Exception as e:
+            st.write(f"- Notion: ❌ 接続失敗 ({str(e)})")
         
         return {
             "openai_key": openai_key,
@@ -470,15 +501,38 @@ def get_summary(prompt, result, model, apis):
 def add_summary_to_notion(summary, apis):
     """Notionに要約を追加"""
     try:
+        # デバッグ情報を表示
+        st.write("🔍 デバッグ: Notion連携開始")
+        st.write(f"- summary keys: {list(summary.keys())}")
+        st.write(f"- notion_db_url: {apis['notion_db_url']}")
+        
+        # データ検証
         if not all(key in summary for key in ["title", "summary", "url", "date"]):
-            return False, "要約データが不完全です。"
+            missing_keys = [key for key in ["title", "summary", "url", "date"] if key not in summary]
+            return False, f"要約データが不完全です。不足: {missing_keys}"
             
         if not summary["title"].strip() or not summary["summary"].strip():
             return False, "タイトルまたは要約が空です。"
-            
-        apis["notion_client"].pages.create(**{
+        
+        # Notion Database IDの形式確認
+        notion_db_id = apis["notion_db_url"]
+        if "notion.so" in notion_db_id:
+            # URLからIDを抽出
+            import re
+            match = re.search(r'([a-f0-9]{32})', notion_db_id)
+            if match:
+                notion_db_id = match.group(1)
+            else:
+                return False, "Notion Database URLからIDを抽出できませんでした"
+        
+        # ハイフンを除去
+        notion_db_id = notion_db_id.replace('-', '')
+        st.write(f"- 処理後のDatabase ID: {notion_db_id}")
+        
+        # Notionページ作成
+        page_data = {
             "parent": { 
-                'database_id': apis["notion_db_url"]
+                'database_id': notion_db_id
             },
             "properties": {
                 "Name": {
@@ -520,29 +574,59 @@ def add_summary_to_notion(summary, apis):
                     }
                 }
             ]
-        })
+        }
+        
+        st.write("🔍 デバッグ: Notion APIにリクエスト送信中...")
+        result = apis["notion_client"].pages.create(**page_data)
+        st.write(f"✅ Notion APIレスポンス: {result.get('id', 'ID不明')}")
+        
         return True, "成功"
+        
     except Exception as e:
-        return False, f"Notion API エラー: {e}"
+        import traceback
+        error_details = traceback.format_exc()
+        st.write(f"❌ 詳細エラー:\n```\n{error_details}\n```")
+        return False, f"Notion API エラー: {str(e)}"
 
 def post_to_slack(message, apis):
     """Slackにメッセージを投稿"""
     try:
+        # デバッグ情報を表示
+        st.write("🔍 デバッグ: Slack連携開始")
+        st.write(f"- Channel: {SLACK_CHANNEL}")
+        st.write(f"- Message length: {len(message)} characters")
+        
         if not message.strip():
             return False, "投稿するメッセージが空です。"
-            
+        
+        # メッセージ長制限
         if len(message) > 4000:
             message = message[:3900] + "\n...(省略)"
-            
+            st.write("⚠️ メッセージが長すぎるため省略しました")
+        
+        # Slack API呼び出し
+        st.write("🔍 デバッグ: Slack APIにリクエスト送信中...")
         response = apis["slack_client"].chat_postMessage(
             channel=SLACK_CHANNEL,
             text=message
         )
+        
+        st.write(f"✅ Slack APIレスポンス: {response.get('ok', False)}")
+        if response.get('ok'):
+            st.write(f"- Message timestamp: {response.get('ts', 'N/A')}")
+        else:
+            st.write(f"- Error: {response.get('error', 'Unknown error')}")
+        
         return True, "成功"
+        
     except SlackApiError as e:
-        return False, f"Slack API エラー: {e}"
+        st.write(f"❌ Slack API Error Code: {e.response['error']}")
+        return False, f"Slack API エラー: {e.response['error']}"
     except Exception as e:
-        return False, f"Slack投稿エラー: {e}"
+        import traceback
+        error_details = traceback.format_exc()
+        st.write(f"❌ 詳細エラー:\n```\n{error_details}\n```")
+        return False, f"Slack投稿エラー: {str(e)}"
 
 def display_paper_info(result):
     """論文情報を表示"""
@@ -739,8 +823,9 @@ def main():
         
         with col1:
             if st.button("📢 Slackに投稿", use_container_width=True):
-                message = "論文のサマリです。\n" + summary_message
-                success, msg = post_to_slack(message, apis)
+                with st.expander("🔍 Slack投稿デバッグ情報", expanded=True):
+                    message = "論文のサマリです。\n" + summary_message
+                    success, msg = post_to_slack(message, apis)
                 if success:
                     st.success("✅ Slackに投稿されました！")
                 else:
@@ -748,7 +833,8 @@ def main():
 
         with col2:
             if st.button("📝 Notionに保存", use_container_width=True):
-                success, msg = add_summary_to_notion(summary_data, apis)
+                with st.expander("🔍 Notion保存デバッグ情報", expanded=True):
+                    success, msg = add_summary_to_notion(summary_data, apis)
                 if success:
                     st.success("✅ Notionに保存されました！")
                 else:
